@@ -11,9 +11,10 @@
 //#define OPTIMIZED
 //#define OPTIMIZATION_REGISTER
 //#define OPTIMIZATION_REGISTER_LOOP_UNROLLING
+//#define OPTIMIZATION_OPENMP_segmentation_fault_you_may_ignore_this
 #define OPTIMIZATION_OPENMP
 /////////////////////////
-#define NUM_THREADS 1
+#define NUM_THREADS 10
 #define REG_A_SIZE 1000
 #define REG_B_SIZE 10000
 #define SNP_LENGTH 10000
@@ -425,10 +426,8 @@ void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myRe
 
 
     // (B) Optimization target
-    int unroll_factor = 5;
-    int unroll_stop = size_b-unroll_factor;
-    int counter_1, counter_2, counter_3;
-    myResultType val_1, val_2, val_3;
+    int unroll_factor = 5; //to unroll we need to keep a variable to tell the program how many iterations to unroll in one.
+    int unroll_stop = size_b-unroll_factor; //a threshold to stop earlier so as to not overextend beyond the size_b. After it ends another for will finish whatever is left.
     for(i=0;i<size_a;i++)
     {
         for(j=0;j<unroll_stop;j+=unroll_factor)
@@ -457,7 +456,7 @@ void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myRe
 
 
 
-#ifdef OPTIMIZATION_OPENMP
+#ifdef OPTIMIZATION_OPENMP_segmentation_fault_you_may_ignore_this
 myResultType get_pairwise_ld_score (myDataType * region_a, myDataType * region_b, int compressed_size, int i, int j)
 {
     register int counter_1, counter_2, counter_3;
@@ -497,12 +496,6 @@ void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myRe
     //For variables that are used to iterate loops it should be fruitful to have them on register
 
     // (A) In-place Data Compression
-    /*
-    Nested parallelization is performed. First split 2 threads one for region a and one for region b. The number of threads in this case is fixed
-    */
-
-    //omp_set_num_threads(2);
-
 
         register int compressed_size = (size_snp/(sizeof(myDataType)*8)+(size_snp%(sizeof(myDataType)*8)!=0?1:0));
 
@@ -585,7 +578,6 @@ void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myRe
                     newind = 0;
                     for(j=0;j<size_snp;j++)
                     {
-                        assert(region_a[i*size_snp+j]==0 | region_a[i*size_snp+j]==1);
                         newbit = region_a[i*size_snp+j]&1;
                         temp <<= 1;
                         temp |= newbit;
@@ -614,7 +606,6 @@ void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myRe
                     newind = 0;
                     for(j=0;j<size_snp;j++)
                     {
-                        assert(region_b[i*size_snp+j]==0 | region_b[i*size_snp+j]==1);
                         newbit = region_b[i*size_snp+j]&1;
                         temp <<= 1;
                         temp |= newbit;
@@ -650,6 +641,148 @@ void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myRe
             for(j=0;j<size_b;j++)
             {
                 results[i*size_b+j] = get_pairwise_ld_score (region_a, region_b, compressed_size, i, j);
+
+            }
+        }
+    }
+    // End of (B) Optimization target
+}
+#endif
+
+#ifdef OPTIMIZATION_OPENMP
+myResultType get_pairwise_ld_score (myDataType * region_a, myDataType * region_b, int size_snp, int i, int j)
+{
+    register int counter_1, counter_2, counter_3;
+    counter_1 = counter_2 = counter_3 = 0;
+    register int k;
+    register int compressed_size = (size_snp/(sizeof(myDataType)*8)+(size_snp%(sizeof(myDataType)*8)!=0?1:0));
+    myResultType result= 0.0f;
+
+    // bit-counting on compressed data
+    for(k=0;k<compressed_size;k++)
+    {//i = snp_index_a , j = snp_index_b
+        counter_1 += POPCOUNT (region_a[i*size_snp+k]);
+        counter_2 += POPCOUNT (region_b[j*size_snp+k]);
+        counter_3 += POPCOUNT (region_a[i*size_snp+k] & region_b[j*size_snp+k]);
+    }
+    // End of LD computation on compressed data
+
+    if((counter_1==SNP_LENGTH)||(counter_2==SNP_LENGTH))
+        return result;
+    myResultType val_1 = ((myResultType)counter_1)/SNP_LENGTH;
+    myResultType val_2 = ((myResultType)counter_2)/SNP_LENGTH;
+    myResultType val_3 = ((myResultType)counter_3)/SNP_LENGTH;
+
+    result  = ((val_3-val_1*val_2)*(val_3-val_1*val_2));
+    result  /= (val_1*val_2*(1.0-val_1)*(1.0-val_2));
+
+    assert(result >=0.0000);
+    assert(result <=1.0001);
+
+    return result;
+}
+
+
+
+void compute_all_pairwise_ld (myDataType * region_a, myDataType * region_b, myResultType * results, int size_a, int size_b, int size_snp)
+{
+
+    //For variables that are used to iterate loops it should be fruitful to have them on register
+
+    // (A) In-place Data Compression
+
+        //with multiple threads things can get erased before another thread may use them. To overcome this we will be using separate arrays for the compact form instead of erasing data from the existing ones.
+        myDataType * compact_region_a = (myDataType*)malloc(sizeof(myDataType)*REG_A_SIZE*SNP_LENGTH);
+        assert(compact_region_a!=NULL);
+
+        myDataType * compact_region_b = (myDataType*)malloc(sizeof(myDataType)*REG_B_SIZE*SNP_LENGTH);
+        assert(compact_region_b!=NULL);
+
+
+        // we call the pragma to request some threads. NUM_THREADS is the number of threads we request
+        #pragma omp parallel num_threads(NUM_THREADS)
+            {
+                //use cyclic distribution of the iterations, iterate by the number of threads so that every thread may get an iteration. This is similar to how one would distribute a deck of cards.
+                register int i, j; //iterators
+                int id = omp_get_thread_num(); //get the ID of the thread
+                int nthreads = omp_get_num_threads(); //sometimes we get less threads than we request, just to make sure we're gonna call them from function instead of using NUM_THREADS
+
+                myDataType temp;
+                myDataType newbit;
+                int bitcounter;
+                int newind;
+
+                for(i=id;i<size_a;i+=nthreads)
+                {
+                    temp = 0;
+                    newbit = 0;
+                    bitcounter = 0;
+                    newind = 0;
+                    for(j=0;j<size_snp;j++)
+                    {
+                        newbit = region_a[i*size_snp+j]&1;
+                        temp <<= 1;
+                        temp |= newbit;
+                        bitcounter++;
+
+                        if(bitcounter==sizeof(myDataType)*8)
+                        {
+                            //Just realized here that compressed size fits better to our new array.
+                            compact_region_a[i*size_snp+newind] = temp;
+                            temp = 0;
+                            bitcounter=0;
+                            newind++;
+                        }
+
+                    }
+                    compact_region_a[i*size_snp+newind] = temp;
+
+                }
+
+
+                for(i=id;i<size_b;i+=nthreads)
+                {
+                    temp = 0;
+                    newbit = 0;
+                    bitcounter = 0;
+                    newind = 0;
+                    for(j=0;j<size_snp;j++)
+                    {
+                        newbit = region_b[i*size_snp+j]&1;
+                        temp <<= 1;
+                        temp |= newbit;
+                        bitcounter++;
+
+                        if(bitcounter==sizeof(myDataType)*8)
+                        {
+                            //Just realized here that compressed size fits better to our new array.
+                            compact_region_b[i*size_snp+newind] = temp;
+                            temp = 0;
+                            bitcounter=0;
+                            newind++;
+                        }
+
+                    }
+                    compact_region_b[i*size_snp+newind] = temp;
+
+                }
+
+
+            }
+
+    // End of In-place Data Compression
+
+
+    // (B) Optimization target
+    #pragma omp parallel num_threads(NUM_THREADS)
+    {
+        register int i, j;
+        #pragma omp for //omp for directly distributes the iterations to different threads. The iterations need to be concurrent.
+        for(i=0;i<size_a;i++)
+        {
+            for(j=0;j<size_b;j++)
+            {
+                results[i*size_b+j] = get_pairwise_ld_score (compact_region_a, compact_region_b, size_snp, i, j);
 
             }
         }
